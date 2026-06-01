@@ -40,9 +40,12 @@ const {
   MAIL_FROM,
   MAIL_FROM_NAME,
   MAIL_TO,
+  PUBLIC_BASE_URL,
   NODE_ENV,
   PORT: ENV_PORT,
 } = process.env;
+
+const BASE_URL = (PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
 const SMTP_PORT_NUM = Number(SMTP_PORT);
 const SMTP_SECURE = process.env.SMTP_SECURE
@@ -95,6 +98,8 @@ const corsOptions = {
   origin: [
     'https://klatovskeploty.cz',
     'https://www.klatovskeploty.cz',
+    'http://klatovskeploty.cz',
+    'http://www.klatovskeploty.cz',
     'https://www.plotana.cz',
     'https://plotana.cz',
     'http://localhost:3000',
@@ -211,6 +216,28 @@ function readRealizace() {
 function writeRealizace(data) {
   fs.writeFileSync(REALIZACE_JSON, JSON.stringify(data, null, 2), 'utf8');
 }
+
+function toAbsoluteImageUrl(p) {
+  if (!p || typeof p !== 'string') return p;
+  if (/^https?:\/\//i.test(p)) return p;
+  if (!BASE_URL) return p;
+  return `${BASE_URL}${p.startsWith('/') ? '' : '/'}${p}`;
+}
+
+function withAbsoluteImages(r) {
+  if (!r) return r;
+  const out = { ...r };
+  if (out.hlavniFoto) out.hlavniFoto = toAbsoluteImageUrl(out.hlavniFoto);
+  if (Array.isArray(out.fotky)) {
+    out.fotky = out.fotky.map((f) =>
+      f && typeof f === 'object' ? { ...f, src: toAbsoluteImageUrl(f.src) } : toAbsoluteImageUrl(f)
+    );
+  }
+  return out;
+}
+
+// Servíruje nahrané fotky realizací pod stejnou cestou, jakou má klient v JSON odpovědi.
+app.use('/images/realizace', express.static(UPLOADS_DIR, { fallthrough: false }));
 
 // ─── Admin: login page ──────────────────────────────────────────────────────────
 app.get('/admin/login', (req, res) => {
@@ -729,10 +756,9 @@ app.post('/admin/realizace/smazat/:id', requireAuth, (req, res) => {
 app.get('/api/realizace', (_req, res) => {
   try {
     const realizace = readRealizace();
-    // Return only fields needed for the gallery listing
-    const summary = realizace.map(({ id, nazev, lokalita, rok, kategorie, popisKratky, popisDlouhy, delka, typ, barva, hlavniFoto }) => ({
-      id, nazev, lokalita, rok, kategorie, popisKratky, popisDlouhy, delka, typ, barva, hlavniFoto,
-    }));
+    const summary = realizace.map(({ id, nazev, lokalita, rok, kategorie, popisKratky, popisDlouhy, delka, typ, barva, hlavniFoto }) =>
+      withAbsoluteImages({ id, nazev, lokalita, rok, kategorie, popisKratky, popisDlouhy, delka, typ, barva, hlavniFoto })
+    );
     res.json(summary);
   } catch {
     res.status(500).json({ error: 'Chyba při načítání realizací.' });
@@ -745,7 +771,7 @@ app.get('/api/realizace/:id', (req, res) => {
     const realizace = readRealizace();
     const r = realizace.find((x) => x.id === req.params.id);
     if (!r) return res.status(404).json({ error: 'Realizace nenalezena.' });
-    res.json(r);
+    res.json(withAbsoluteImages(r));
   } catch {
     res.status(500).json({ error: 'Chyba při načítání realizace.' });
   }
