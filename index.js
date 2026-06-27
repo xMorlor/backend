@@ -56,6 +56,11 @@ const FROM_HEADER = MAIL_FROM_NAME
   ? `${MAIL_FROM_NAME} <${FROM_ADDRESS}>`
   : `Web PLOTANA <${FROM_ADDRESS}>`;
 
+// Ověřovací režim anti-spamu: zachycené zprávy se zatím nezahazují, ale posílají
+// se na tuto adresu označené důvodem, aby se dalo ověřit, že filtr funguje.
+// Až bude filtr ověřený, stačí SPAM_VERIFY_TO vyprázdnit (zachycené se pak tiše zahodí).
+const SPAM_VERIFY_TO = process.env.SPAM_VERIFY_TO ?? 'stepan.kraus7@seznam.cz';
+
 const PORT = ENV_PORT || 3000;
 const isProduction = NODE_ENV === 'production';
 
@@ -122,6 +127,7 @@ app.use(
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    proxy: true,
     cookie: {
       httpOnly: true,
       secure: isProduction,
@@ -168,6 +174,7 @@ const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: SMTP_PORT_NUM,
   secure: SMTP_SECURE,
+  requireTLS: !SMTP_SECURE,
   auth: { user: SMTP_USER, pass: SMTP_PASS },
 });
 
@@ -207,6 +214,14 @@ function escapeHtml(value = '') {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function looksLikeGibberish(s = '') {
+  const t = String(s).replace(/\s/g, '');
+  if (t.length < 10) return false;            // krátké texty neřešíme
+  if (/\s/.test(String(s).trim())) return false; // má mezery = nech projít
+  const vowels = (t.match(/[aeiouyáéíóúůýěAEIOUY]/g) || []).length;
+  return vowels / t.length < 0.18;            // skoro žádné samohlásky = balast
 }
 
 function readRealizace() {
@@ -784,17 +799,43 @@ app.get('/admin/api/me', requireAuth, (req, res) => {
 
 // ─── Contact form ───────────────────────────────────────────────────────────────
 app.post('/api/send-email', emailLimiter, upload.array('fotky', 5), async (req, res) => {
-  const { name, phone, email, message, adress, interests, website } = req.body;
+  const { name, phone, email, message, adress, interests, website, formElapsedMs } = req.body;
   const files = req.files;
 
+  // ── Anti-spam: detekce + ověřovací režim ───────────────────────────────────
+  // Zachytáváme: honeypot, příliš rychlé odeslání a balastní text.
+  // Místo tichého zahození zatím zachycenou zprávu OZNAČÍME a pošleme na
+  // ověřovací adresu (SPAM_VERIFY_TO), aby šlo ověřit, že filtr funguje správně.
+  let spamReason = null;
+
+  // 1) Honeypot – pole „website" je pro člověka neviditelné (mimo obrazovku),
+  //    takže ho vyplní jen bot.
   if (website) {
-    console.log('🤖 Spam bot zachycen.');
-    return res.status(200).json({ success: true, message: 'E-mail odeslán!' });
+    spamReason = 'honeypot (vyplněné skryté pole „website")';
+  } else {
+    // 2) Časová značka – formulář odeslaný pod 3 sekundy je téměř jistě bot.
+    const elapsed = Number(formElapsedMs);
+    if (!Number.isFinite(elapsed) || elapsed < 3000) {
+      spamReason = `příliš rychlé odeslání (${formElapsedMs ?? 'chybí'} ms, limit 3000 ms)`;
+    } else if (looksLikeGibberish(name) || looksLikeGibberish(message)) {
+      // 3) Balastní jméno / zpráva – náhodné řetězce bez samohlásek a bez mezer.
+      spamReason = 'balastní text (jméno nebo zpráva bez samohlásek)';
+    }
   }
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (email && !emailRegex.test(email)) return res.status(400).json({ error: 'Neplatná e-mailová adresa.' });
-  if (!name || String(name).trim().length < 2) return res.status(400).json({ error: 'Jméno je povinné.' });
+
+  // Validace polí provádíme jen u skutečných poptávek – u spamu může být cokoli.
+  if (!spamReason) {
+    if (email && !emailRegex.test(email)) return res.status(400).json({ error: 'Neplatná e-mailová adresa.' });
+    if (!name || String(name).trim().length < 2) return res.status(400).json({ error: 'Jméno je povinné.' });
+  }
+
+  // Zachycený spam bez ověřovací adresy se tiše zahodí (bot dostane „úspěch").
+  if (spamReason && !SPAM_VERIFY_TO) {
+    console.log(`🤖 Spam zachycen (${spamReason}) – zahozeno.`);
+    return res.status(200).json({ success: true, message: 'E-mail odeslán!' });
+  }
 
   try {
     const v = {
@@ -806,10 +847,19 @@ app.post('/api/send-email', emailLimiter, upload.array('fotky', 5), async (req, 
       adresa: escapeHtml(adress) || 'Nebylo vybráno z mapy',
     };
 
+    const spamBanner = spamReason
+      ? `<div style="background:#fdecea;border:1px solid #f5c6cb;color:#b00020;padding:12px;border-radius:6px;margin-bottom:16px;font-weight:bold;">
+           ⚠️ ZACHYCENO ANTI-SPAM FILTREM<br>
+           <span style="font-weight:normal;">Důvod: ${escapeHtml(spamReason)}</span><br>
+           <span style="font-weight:normal;font-size:12px;">Tato zpráva by za normálního provozu nebyla doručena. Slouží k ověření filtru.</span>
+         </div>`
+      : '';
+
     const html = `
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#222;">
+        ${spamBanner}
         <h2 style="color:#2c5f2d;border-bottom:2px solid #2c5f2d;padding-bottom:8px;">
-          Nová poptávka z webu PLOTANA
+          ${spamReason ? '[SPAM] ' : ''}Nová poptávka z webu PLOTANA
         </h2>
         <table style="width:100%;border-collapse:collapse;margin-top:16px;">
           <tr><td style="padding:6px 0;font-weight:bold;width:130px;">Jméno:</td><td>${v.name}</td></tr>
@@ -824,6 +874,9 @@ app.post('/api/send-email', emailLimiter, upload.array('fotky', 5), async (req, 
     `;
 
     const text = [
+      spamReason ? `⚠️ ZACHYCENO ANTI-SPAM FILTREM – důvod: ${spamReason}` : null,
+      spamReason ? 'Tato zpráva by za normálního provozu nebyla doručena (ověření filtru).' : null,
+      spamReason ? '' : null,
       'Nová poptávka z webu PLOTANA',
       '',
       `Jméno:   ${v.name}`,
@@ -834,15 +887,19 @@ app.post('/api/send-email', emailLimiter, upload.array('fotky', 5), async (req, 
       '',
       'Zpráva:',
       v.message,
-    ].join('\n');
+    ].filter((line) => line !== null).join('\n');
 
     const mailOptions = {
       from: FROM_HEADER,
-      to: MAIL_TO,
-      subject: `Nová poptávka: ${escapeHtml(name) || 'Neznámý'}`,
+      // Zachycený spam jde na ověřovací adresu, skutečná poptávka na MAIL_TO.
+      to: spamReason ? SPAM_VERIFY_TO : MAIL_TO,
+      subject: spamReason
+        ? `[SPAM ZACHYCEN] ${escapeHtml(name) || 'Neznámý'}`
+        : `Nová poptávka: ${escapeHtml(name) || 'Neznámý'}`,
       html,
       text,
-      replyTo: email && emailRegex.test(email) ? email : undefined,
+      // U spamu nenastavujeme replyTo (mohl by být podvržený), jen u reálné poptávky.
+      replyTo: !spamReason && email && emailRegex.test(email) ? email : undefined,
     };
 
     if (files?.length > 0) {
@@ -854,7 +911,11 @@ app.post('/api/send-email', emailLimiter, upload.array('fotky', 5), async (req, 
     }
 
     const info = await transporter.sendMail(mailOptions);
-    console.log('✅ E-mail odeslán:', info.messageId);
+    if (spamReason) {
+      console.log(`🤖 Spam zachycen (${spamReason}) – přeposláno na ${SPAM_VERIFY_TO}:`, info.messageId);
+    } else {
+      console.log('✅ E-mail odeslán:', info.messageId);
+    }
     return res.status(200).json({ success: true, message: 'E-mail odeslán!' });
   } catch (error) {
     console.error('❌ SMTP error:', error);
